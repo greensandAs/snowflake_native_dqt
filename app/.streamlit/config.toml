@@ -1,0 +1,9 @@
+# Streamlit theme for DQ Framework (Tiger Analytics)
+# Pin to dark so the app (incl. native st.dataframe grid) stays dark
+# regardless of the Snowsight Light/Dark appearance setting.
+[theme]
+base = "dark"
+primaryColor = "#F15A22"
+backgroundColor = "#0D0F14"
+secondaryBackgroundColor = "#13161E"
+textColor = "#E8ECF4"

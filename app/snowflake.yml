@@ -1,0 +1,20 @@
+# created-by: streamlit-in-workspaces; skill-version=1.0.0
+definition_version: 2
+entities:
+  streamlit_app:
+    type: streamlit
+    identifier:
+      database: DQ_FRAMEWORK
+      schema: APP
+      name: DQAPP_EA
+    title: DATA QUALITY APP (EA)
+    query_warehouse: DQ_APP_EARLY_WH
+    compute_pool: SYSTEM_COMPUTE_POOL_CPU
+    run_mode: SpcsOnly
+    execute_as: OWNER
+    main_file: streamlit_app.py
+    artifacts:
+      - pyproject.toml
+      - streamlit_app.py
+      - .streamlit/config.toml
+      - _font_face.css
