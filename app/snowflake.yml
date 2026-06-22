@@ -18,3 +18,17 @@ entities:
       - streamlit_app.py
       - .streamlit/config.toml
       - _font_face.css
+      - shared/__init__.py
+      - shared/db.py
+      - shared/style.py
+      - shared/helpers.py
+      - shared/charts.py
+      - pages/__init__.py
+      - pages/home.py
+      - pages/projects.py
+      - pages/datasets.py
+      - pages/rules.py
+      - pages/jobs.py
+      - pages/results.py
+      - pages/reconciliation.py
+      - pages/schedules.py

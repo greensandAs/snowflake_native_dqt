@@ -1,3 +1,5 @@
+# DQ Framework deployment utility with corrected paths and migration tracking
+# Co-authored with CoCo
 from __future__ import annotations
 
 import glob
@@ -10,15 +12,23 @@ try:
 except ImportError:
     sys.exit("snowflake-connector-python is required:  pip install snowflake-connector-python")
 
-# ── Paths — kernel CWD is already inside DQM/ ──
-HERE = os.getcwd()
-DDL_DIR = os.path.join(HERE, "DDL")
-SEED_FILE = os.path.join(HERE, "DML.sql")
-PROC_DIR = os.path.join(HERE, "Procedures")
+# ── Paths — resolve relative to this script's location (DQM/utility/) ──
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # DQM/
+DDL_DIR = os.path.join(PROJECT_ROOT, "ddl_dml")
+SEED_FILE = os.path.join(PROJECT_ROOT, "ddl_dml", "V1.1.0__seed_metadata.sql")
+PROC_DIR = os.path.join(PROJECT_ROOT, "procedures")
 HANDLER_DIR = os.path.join(PROC_DIR, "Handlers")
 
 FRAMEWORK_DB = "DQ_FRAMEWORK"
 FRAMEWORK_SCHEMA = "METADATA"
+
+# Schemachange-compatible variable substitution
+VARS = {
+    "framework_db": FRAMEWORK_DB,
+    "framework_schema": FRAMEWORK_SCHEMA,
+    "error_schema": "DQ_ERRORS",
+}
 
 
 def get_connection():
@@ -46,6 +56,9 @@ def get_connection():
 def run_file(conn, path: str) -> tuple[bool, str]:
     with open(path, encoding="utf-8", errors="replace") as fh:
         sql = fh.read()
+    # Substitute schemachange {{var}} placeholders
+    for key, val in VARS.items():
+        sql = sql.replace("{{" + key + "}}", val)
     try:
         cursors = conn.execute_string(sql, remove_comments=False)
         for cur in cursors:
@@ -58,15 +71,24 @@ def run_file(conn, path: str) -> tuple[bool, str]:
 def collect_files(phase: str) -> list[str]:
     files: list[str] = []
     if phase in ("tables", "all"):
-        files.extend(sorted(glob.glob(os.path.join(DDL_DIR, "V*__*.sql"))))
+        # DDL files: V1.0.0__create_framework_tables.sql etc.
+        ddl_files = sorted(glob.glob(os.path.join(DDL_DIR, "V*__*.sql")))
+        # Exclude seed files from DDL phase (they go in "seed")
+        files.extend(f for f in ddl_files if "seed" not in os.path.basename(f).lower())
     if phase in ("seed", "all"):
-        if os.path.exists(SEED_FILE):
+        # Seed files: V1.1.0__seed_metadata.sql or any file with "seed" in name
+        seed_files = sorted(glob.glob(os.path.join(DDL_DIR, "V*__*seed*.sql")))
+        if seed_files:
+            files.extend(seed_files)
+        elif os.path.exists(SEED_FILE):
             files.append(SEED_FILE)
     if phase in ("procedures", "all"):
+        # Orchestrators first (order matters: master before project)
         for fn in ("R__execute_dq_rules_master.sql", "R__execute_dq_rules_project.sql"):
             p = os.path.join(PROC_DIR, fn)
             if os.path.exists(p):
                 files.append(p)
+        # Then all handlers
         files.extend(sorted(glob.glob(os.path.join(HANDLER_DIR, "R__*.sql"))))
     return files
 
@@ -85,13 +107,13 @@ def deploy(phase: str = "all") -> int:
     try:
         conn.cursor().execute(f"USE DATABASE {FRAMEWORK_DB}")
         conn.cursor().execute(f"USE SCHEMA {FRAMEWORK_SCHEMA}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  Warning: Could not set session context: {e}")
 
     ok, failed = 0, []
     t0 = time.time()
     for f in files:
-        rel = os.path.relpath(f, HERE)
+        rel = os.path.relpath(f, PROJECT_ROOT)
         success, err = run_file(conn, f)
         if success:
             ok += 1
@@ -111,5 +133,6 @@ def deploy(phase: str = "all") -> int:
     return 0
 
 
-# ── Deploy all phases ──
-deploy(phase="all")
+if __name__ == "__main__":
+    phase = sys.argv[1] if len(sys.argv) > 1 else "all"
+    sys.exit(deploy(phase=phase))

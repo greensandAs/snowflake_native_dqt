@@ -1,5 +1,5 @@
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 
 CREATE OR REPLACE PROCEDURE SP_TABLE_COLUMNS_MATCH_ORDERED_LIST_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)
@@ -72,7 +72,7 @@ BEGIN
     VALUES (:v_run_id, :v_check_config_id, :v_procedure_name, :v_step, CURRENT_TIMESTAMP(), ''STARTED'', ''Loading configuration'');
     
     BEGIN
-        v_sql := ''SELECT DQ_DB_NAME, DQ_SCHEMA_NAME, SUCCESS_CODE, FAILED_CODE, EXECUTION_ERROR FROM DQ_JOB_EXEC_CONFIG WHERE DQ_DB_NAME = ''''DQ_FRAMEWORK'''' AND DQ_SCHEMA_NAME = ''''METADATA'''''';
+        v_sql := ''SELECT DQ_DB_NAME, DQ_SCHEMA_NAME, SUCCESS_CODE, FAILED_CODE, EXECUTION_ERROR FROM DQ_JOB_EXEC_CONFIG LIMIT 1'';
         v_result := (EXECUTE IMMEDIATE v_sql);
         LET v_config_cursor CURSOR FOR v_result;
         FOR config_record IN v_config_cursor DO

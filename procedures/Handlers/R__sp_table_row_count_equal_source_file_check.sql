@@ -1,6 +1,6 @@
 -- Source-file to CORE row-count recon handler (reads sync counts from an audit-control table)
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 CREATE OR REPLACE PROCEDURE SP_TABLE_ROW_COUNT_EQUAL_SOURCE_FILE_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)
 LANGUAGE PYTHON

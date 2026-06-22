@@ -1,0 +1,28 @@
+# schemachange configuration for DQ Framework migrations
+# See: https://github.com/Snowflake-Labs/schemachange
+
+config-version: 1
+
+# Root folder containing versioned (V*), repeatable (R*), and always (A*) scripts
+root-folder: ddl_dml
+
+# Snowflake connection
+snowflake-account: null  # set via env SNOWFLAKE_ACCOUNT
+snowflake-user: null     # set via env SNOWFLAKE_USER
+snowflake-role: DQ_ADMIN
+snowflake-warehouse: COMPUTE_WH
+
+# Change tracking table (records which migrations have been applied)
+change-history-table:
+  database-name: DQ_FRAMEWORK
+  schema-name: METADATA
+  table-name: SCHEMACHANGE_HISTORY
+
+# Create the change history table if it doesn't exist
+create-change-history-table: true
+
+# Variables available in scripts via {{var}} syntax
+vars:
+  framework_db: DQ_FRAMEWORK
+  framework_schema: METADATA
+  error_schema: DQ_ERRORS

@@ -1,7 +1,9 @@
--- Sample data for ROW_COUNT_MATCH (plain + SCD2) and SOURCE_FILE_COUNT_MATCH checks
-SELECT * FROM DQ_FRAMEWORK.METADATA.DQ_RECON_RESULTS 
-WHERE TABLE_NAME ILIKE '%ORDER%' 
-ORDER BY AUDIT_TIMESTAMP DESC;
+-- Sample data for DQ framework: ROW_COUNT_MATCH (plain + SCD2) and SOURCE_FILE_COUNT_MATCH checks
+-- Co-authored with CoCo
+
+
+
+SELECT * FROM DQ_FRAMEWORK.METADATA.DQ_PROJECT_RUN_LOG;
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- SECTION 1: Create SAMPLE_DATA database and tables
@@ -45,7 +47,7 @@ CREATE OR REPLACE TABLE CUSTOMERS_CORE (
     EMAIL            VARCHAR(200),
     CITY             VARCHAR(50),
     TIER             VARCHAR(20),
-    INSERT_DATE_TIME TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    INSERT_DATE_TIME TIMESTAMP_NTZ 
 );
 
 -- Conformed SCD2: contains current + historical versions (IS_ACTIVE flag tracks which is live)
@@ -57,8 +59,8 @@ CREATE OR REPLACE TABLE CUSTOMERS_CONFORMED (
     CITY             VARCHAR(50),
     TIER             VARCHAR(20),
     IS_ACTIVE        VARCHAR(1) DEFAULT 'Y',
-    INSERT_DATE_TIME TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
-    UPDATE_DATE_TIME TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    INSERT_DATE_TIME TIMESTAMP_NTZ ,
+    UPDATE_DATE_TIME TIMESTAMP_NTZ 
 );
 
 -- ─── Audit control table (TEST_AUDIT_LOG) ────────────────────────────────────
@@ -103,28 +105,30 @@ SELECT ORDER_ID, CUSTOMER_ID, ORDER_DATE, AMOUNT, STATUS FROM ORDERS_CORE;
 
 -- ─── Customers SCD2 test ─────────────────────────────────────────────────────
 -- Core has 5 distinct customers (landed from source files)
-INSERT INTO CUSTOMERS_CORE (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, CITY, TIER)
+-- INSERT_DATE_TIME reflects when file landed in core (source-to-core sync time)
+INSERT INTO CUSTOMERS_CORE (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, CITY, TIER, INSERT_DATE_TIME)
 VALUES
-    (101, 'Alice Smith',   'alice@example.com',   'London',    'GOLD'),
-    (102, 'Bob Johnson',   'bob@example.com',     'Paris',     'SILVER'),
-    (103, 'Carol White',   'carol@example.com',   'Berlin',    'GOLD'),
-    (104, 'David Brown',   'david@example.com',   'Madrid',    'BRONZE'),
-    (105, 'Eve Davis',     'eve@example.com',     'Rome',      'SILVER');
+    (101, 'Alice Smith',   'alice@example.com',   'London',    'GOLD',   '2025-01-24 11:10:05.000'),
+    (102, 'Bob Johnson',   'bob@example.com',     'Paris',     'SILVER', '2025-01-24 11:10:06.000'),
+    (103, 'Carol White',   'carol@example.com',   'Berlin',    'GOLD',   '2025-01-24 11:10:07.000'),
+    (104, 'David Brown',   'david@example.com',   'Madrid',    'BRONZE', '2025-01-24 11:11:05.000'),
+    (105, 'Eve Davis',     'eve@example.com',     'Rome',      'SILVER', '2025-01-24 11:12:05.000');
 
 -- Conformed SCD2 has 8 rows: 5 active (current) + 3 inactive (historical versions)
 -- Active count (5) should equal core count (5) → PASS
+-- UPDATE_DATE_TIME is 3-5 hours after core INSERT_DATE_TIME (conformed ETL runs later)
 INSERT INTO CUSTOMERS_CONFORMED (CUSTOMER_SK, CUSTOMER_ID, CUSTOMER_NAME, EMAIL, CITY, TIER, IS_ACTIVE, INSERT_DATE_TIME, UPDATE_DATE_TIME)
 VALUES
-    -- Historical (inactive) rows
-    (1, 101, 'Alice Smith',   'alice_old@example.com', 'Manchester', 'SILVER', 'N', '2024-06-01', '2024-12-01'),
-    (2, 102, 'Bob Johnson',   'bob@example.com',       'Lyon',       'BRONZE', 'N', '2024-06-01', '2024-11-15'),
-    (3, 103, 'Carol White',   'carol@example.com',     'Munich',     'SILVER', 'N', '2024-06-01', '2025-01-10'),
-    -- Current (active) rows
-    (4, 101, 'Alice Smith',   'alice@example.com',     'London',     'GOLD',   'Y', '2024-12-01', '2024-12-01'),
-    (5, 102, 'Bob Johnson',   'bob@example.com',       'Paris',      'SILVER', 'Y', '2024-11-15', '2024-11-15'),
-    (6, 103, 'Carol White',   'carol@example.com',     'Berlin',     'GOLD',   'Y', '2025-01-10', '2025-01-10'),
-    (7, 104, 'David Brown',   'david@example.com',     'Madrid',     'BRONZE', 'Y', '2024-06-01', '2024-06-01'),
-    (8, 105, 'Eve Davis',     'eve@example.com',       'Rome',       'SILVER', 'Y', '2024-06-01', '2024-06-01');
+    -- Historical (inactive) rows (expired when current versions arrived)
+    (1, 101, 'Alice Smith',   'alice_old@example.com', 'Manchester', 'SILVER', 'N', '2024-06-01 14:30:00.000', '2025-01-24 14:15:00.000'),
+    (2, 102, 'Bob Johnson',   'bob@example.com',       'Lyon',       'BRONZE', 'N', '2024-06-01 14:30:00.000', '2025-01-24 14:15:00.000'),
+    (3, 103, 'Carol White',   'carol@example.com',     'Munich',     'SILVER', 'N', '2024-06-01 14:30:00.000', '2025-01-24 14:15:00.000'),
+    -- Current (active) rows — UPDATE_DATE_TIME is ~3 hrs after core load (11:10 → 14:15)
+    (4, 101, 'Alice Smith',   'alice@example.com',     'London',     'GOLD',   'Y', '2025-01-24 14:15:00.000', '2025-01-24 14:15:00.000'),
+    (5, 102, 'Bob Johnson',   'bob@example.com',       'Paris',      'SILVER', 'Y', '2025-01-24 14:15:00.000', '2025-01-24 14:15:00.000'),
+    (6, 103, 'Carol White',   'carol@example.com',     'Berlin',     'GOLD',   'Y', '2025-01-24 14:15:00.000', '2025-01-24 14:15:00.000'),
+    (7, 104, 'David Brown',   'david@example.com',     'Madrid',     'BRONZE', 'Y', '2025-01-24 14:15:00.000', '2025-01-24 14:15:00.000'),
+    (8, 105, 'Eve Davis',     'eve@example.com',       'Rome',       'SILVER', 'Y', '2025-01-24 14:15:00.000', '2025-01-24 14:15:00.000');
 
 -- ─── Audit log entries ───────────────────────────────────────────────────────
 -- Realistic sample data matching the PRISM audit control pattern
@@ -295,6 +299,50 @@ VALUES
 -- CALL DQ_FRAMEWORK.METADATA.EXECUTE_DQ_RULES_PROJECT(1, 2);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- SECTION 6B: Incremental SCD2 row count check
+-- Simulates a delta load: 2 new customers + 1 update (address change for ID 104)
+-- After this increment:
+--   CUSTOMERS_CORE   = 7 rows (5 original + 2 new from delta)
+--   CUSTOMERS_CONFORMED = 12 rows total (7 active + 5 historical)
+--   Active count (7) = Core count (7) → PASS
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+-- Step 1: New delta rows arrive in CORE (new customers from source file)
+INSERT INTO CUSTOMERS_CORE (CUSTOMER_ID, CUSTOMER_NAME, EMAIL, CITY, TIER, INSERT_DATE_TIME)
+VALUES
+    (106, 'Frank Miller',  'frank@example.com',  'Vienna',    'GOLD',   '2025-02-01 10:10:05.000'),
+    (107, 'Grace Lee',     'grace@example.com',  'Tokyo',     'SILVER', '2025-02-01 10:10:05.000');
+
+-- Step 2: Apply SCD2 in CONFORMED
+-- 2a: Expire the old active row for customer 104 (address changed Madrid → Barcelona)
+UPDATE CUSTOMERS_CONFORMED
+SET IS_ACTIVE = 'N', UPDATE_DATE_TIME = '2025-02-01 14:30:00.000'
+WHERE CUSTOMER_ID = 104 AND IS_ACTIVE = 'Y';
+
+-- 2b: Insert new active version for customer 104 + new customers 106, 107
+-- UPDATE_DATE_TIME is ~4.5 hrs after core INSERT_DATE_TIME (10:10 → 14:30)
+INSERT INTO CUSTOMERS_CONFORMED (CUSTOMER_SK, CUSTOMER_ID, CUSTOMER_NAME, EMAIL, CITY, TIER, IS_ACTIVE, INSERT_DATE_TIME, UPDATE_DATE_TIME)
+VALUES
+    -- Updated version of 104 (new active row)
+    (9,  104, 'David Brown',  'david@example.com',  'Barcelona', 'GOLD',   'Y', '2025-02-01 14:30:00.000', '2025-02-01 14:30:00.000'),
+    -- Brand new customers
+    (10, 106, 'Frank Miller', 'frank@example.com',  'Vienna',    'GOLD',   'Y', '2025-02-01 14:30:00.000', '2025-02-01 14:30:00.000'),
+    (11, 107, 'Grace Lee',    'grace@example.com',  'Tokyo',     'SILVER', 'Y', '2025-02-01 14:30:00.000', '2025-02-01 14:30:00.000');
+
+-- Step 3: Update audit log for the incremental file
+INSERT INTO TEST_AUDIT_LOG (BATCH_ID, RUN_ID, JOB_ID, SOURCE_OBJECT_NAME, TARGET_TABLE, NUMBER_OF_RECORDS_SOURCE, NUMBER_OF_RECORDS_TARGET, SYNC_LEVEL, SYNC_STATUS, SYNC_START_DATE_TIME, SYNC_END_DATE_TIME)
+VALUES
+    ('customers_20250201', 'run_20250201101000', 'src_to_core_20250201',
+     '@SAMPLE_DATA.PUBLIC.LANDING_STAGE/customers/input/Customer_DELTA_20250201.csv#customers#core/customers_s3.json',
+     'SAMPLE_DATA.PUBLIC.CUSTOMERS_CORE', 3, 3, 'SOURCE_TO_CORE', 'Success',
+     '2025-02-01 10:10:00.000 -0500', '2025-02-01 10:10:08.000 -0500');
+
+-- Verification queries:
+-- SELECT COUNT(*) FROM CUSTOMERS_CORE;                                          -- Expected: 7
+-- SELECT COUNT(*) FROM CUSTOMERS_CONFORMED WHERE IS_ACTIVE = 'Y';              -- Expected: 7 (PASS)
+-- SELECT COUNT(*) FROM CUSTOMERS_CONFORMED;                                     -- Expected: 12 total (7 active + 5 historical)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- SECTION 7: Simulate FAILURE scenarios (uncomment to test)
 -- ═══════════════════════════════════════════════════════════════════════════════
 
@@ -320,3 +368,13 @@ SELECT * FROM DQ_FRAMEWORK.METADATA.DQ_DATASET_RUN_LOG ORDER BY DATASET_RUN_ID D
 SELECT * FROM DQ_FRAMEWORK.METADATA.DQ_RULE_AUDIT_LOG ORDER BY START_TIMESTAMP DESC;
 SELECT * FROM DQ_FRAMEWORK.METADATA.DQ_RULE_CONFIG WHERE DATASET_ID IN (1, 2);
 SELECT * FROM SAMPLE_DATA.PUBLIC.TEST_AUDIT_LOG;
+
+
+delete from dq_rule_results where dataset_id = 3; order by run_timestamp desc ;
+
+
+select * from sample_data.public.customers_core;
+select * from sample_data.public.customers_conformed;
+
+
+

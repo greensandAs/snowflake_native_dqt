@@ -1,6 +1,6 @@
--- SCD recon handler with full/incremental modes, data-based watermark, and total cross-check
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+-- SCD recon handler: uses INSERT_DATE_TIME for inactive-count existence check with MIN() fallback
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 CREATE OR REPLACE PROCEDURE SP_TABLE_ROW_COUNT_EQUAL_OTHER_TABLE_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)
 LANGUAGE PYTHON
@@ -101,6 +101,7 @@ def main(session, RULE):
         inactive_value = kw.get("inactive_value", "N")
         core_date = kw.get("core_insert_date_col") or "INSERT_DATE_TIME"
         conf_date = kw.get("conformed_update_date_col") or "UPDATE_DATE_TIME"
+        conf_insert_date_cfg = kw.get("conformed_insert_date_col")
         pk = kw.get("partition_keys") or kw.get("compare_cols") or []
         if isinstance(pk, str):
             pk = [c.strip() for c in pk.split(",") if c.strip()]
@@ -124,6 +125,35 @@ def main(session, RULE):
                     validation_on, str(core_val), str(conf_val), result,
                     "WHEN CORE_VALUE = CONFORMED_VALUE THEN PASS ELSE FAIL"]
         ).collect()
+
+    # ─── Resolve conf_insert_date: column used for existence check in INACTIVE_COUNT
+    # If explicitly configured in KWARGS, use it. Otherwise check if INSERT_DATE_TIME
+    # exists in the conformed table; fall back to conf_date (UPDATE_DATE_TIME) if not.
+    # This handles tables that only have UPDATE_DATE_TIME and no separate INSERT_DATE_TIME.
+    # NOTE: The MIN(UPDATE_DATE_TIME) fallback assumes the SCD2 pattern does NOT update
+    # UPDATE_DATE_TIME on the expired row. If your pattern DOES mutate it on expiry,
+    # add an INSERT_DATE_TIME column or set conformed_insert_date_col in KWARGS.
+    if conf_insert_date_cfg:
+        conf_insert_date = conf_insert_date_cfg
+    elif src_type == "TABLE":
+        try:
+            col_check = session.sql(
+                f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE TABLE_CATALOG = ? AND TABLE_SCHEMA = ? AND TABLE_NAME = ? "
+                f"AND UPPER(COLUMN_NAME) = 'INSERT_DATE_TIME'",
+                params=[src_db, src_sch, src_tbl]
+            ).collect()
+            conf_insert_date = "INSERT_DATE_TIME" if col_check else conf_date
+        except Exception:
+            conf_insert_date = conf_date
+    else:
+        conf_insert_date = conf_date
+
+    if conf_insert_date == conf_date and scd_type == 2:
+        audit("COLUMN_RESOLUTION", "COMPLETED",
+              msg=f"No INSERT_DATE_TIME in conformed table — using MIN({conf_date}) fallback. "
+                  f"If your SCD2 pattern mutates {conf_date} on expiry, add INSERT_DATE_TIME "
+                  f"or set conformed_insert_date_col in KWARGS for accurate INACTIVE_COUNT.")
 
     # ─── 3. RECON MODE & PER-LAYER WATERMARKS ──────────────────────────────
     recon_mode = (kw.get("recon_mode") or "incremental").strip().lower()
@@ -155,6 +185,15 @@ def main(session, RULE):
             audit("WATERMARK_LOOKUP", "COMPLETED", msg="No prior run found, full scan for this run")
 
     has_wm = core_wm is not None and conf_wm is not None
+
+    # KEY BEHAVIOR: If recon_mode is incremental but no watermark exists (first run),
+    # fall back to full recon to establish a baseline. Subsequent runs will use incremental
+    # because this run stores watermarks in OBSERVED_VALUE.
+    effective_mode = recon_mode
+    if recon_mode == "incremental" and scd_type in (1, 2) and not has_wm:
+        effective_mode = "full"
+        audit("MODE_FALLBACK", "COMPLETED",
+              msg="No watermark found for incremental mode. Falling back to FULL recon for this run to establish baseline.")
 
     # Capture current max timestamps per layer — these become the NEXT run's watermarks
     current_max_core_date = None
@@ -191,7 +230,8 @@ def main(session, RULE):
                 """Count comparison for active/inactive/total."""
                 cflag = f" AND {flag_col} = ?" if flag_value is not None else ""
 
-                if recon_mode == "full":
+                if effective_mode == "full":
+                    # Full recon: compare entire tables (no date filter)
                     core_sql = f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup})"
                     conf_sql = f"SELECT COUNT(*)::INT AS CNT FROM {conf_from} WHERE 1=1{cflag}"
                     core_params = []
@@ -211,16 +251,9 @@ def main(session, RULE):
                     conf_params = [conf_wm] + ([flag_value] if flag_value is not None else [])
 
                 else:
-                    # First run (no watermark): use MAX(date) on both sides, NO intersection
-                    # This catches missing records (unlike the old template)
-                    core_sql = (
-                        f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup}) "
-                        f"WHERE {core_date} = (SELECT MAX({core_date}) FROM ({core_dedup}))"
-                    )
-                    conf_sql = (
-                        f"SELECT COUNT(*)::INT AS CNT FROM {conf_from} "
-                        f"WHERE {conf_date} = (SELECT MAX({conf_date}) FROM {conf_from}){cflag}"
-                    )
+                    # Safety net fallback (full)
+                    core_sql = f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup})"
+                    conf_sql = f"SELECT COUNT(*)::INT AS CNT FROM {conf_from} WHERE 1=1{cflag}"
                     core_params = []
                     conf_params = [flag_value] if flag_value is not None else []
 
@@ -237,30 +270,54 @@ def main(session, RULE):
                 total, mism = cv, abs(cv - ov)
                 results_obj = {"total": {"core": cv, "conformed": ov, "result": r}}
 
-            # ─── SCD2: active + inactive + total cross-check ─────────────────
+            # ─── SCD2: active count in full mode; active + inactive in incremental ──
             else:
-                # ACTIVE_COUNT: all new/updated records should appear as active
+                # ACTIVE_COUNT: core distinct count vs conformed active count
                 ac, ao, ar = recon_count("ACTIVE_COUNT", active_value)
 
-                # INACTIVE_COUNT: only UPDATES create inactive records
-                # (new inserts don't have a prior version to expire)
-                if recon_mode == "full":
-                    # Full mode: deduped CORE vs all inactive in CONFORMED
-                    ic, io, ir = recon_count("INACTIVE_COUNT", inactive_value)
+                if effective_mode == "full":
+                    # Full mode (baseline): only check active count.
+                    # INACTIVE_COUNT is not meaningful for core-vs-conformed in full mode
+                    # because core does not track historical versions — it only has current state.
+                    # The watermark stored here enables true incremental on the next run.
+                    overall_pass = (ar == "PASS")
+                    total = ac
+                    mism = abs(ac - ao)
+                    results_obj = {
+                        "active": {"core": ac, "conformed": ao, "result": ar},
+                    }
 
                 elif has_wm:
                     # Incremental with per-layer watermarks:
-                    # CORE side: records after core_wm whose keys ALREADY EXISTED
-                    #            as active in CONFORMED before conf_wm (= updates)
-                    ic_core_sql = (
-                        f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup}) "
-                        f"WHERE {core_date} > ? "
-                        f"AND ({trimmed}) IN ("
-                        f"  SELECT {trimmed} FROM {conf_from} "
-                        f"  WHERE {conf_date} <= ? AND {flag_col} = ?)"
-                    )
+                    # INACTIVE_COUNT core side: new core records whose keys ALREADY EXISTED
+                    #   in CONFORMED before conf_wm.
+                    # If conf_insert_date == conf_date (fallback, no INSERT_DATE_TIME column),
+                    #   we use MIN(UPDATE_DATE_TIME) per key via GROUP BY/HAVING. This finds
+                    #   the earliest timestamp for each key (= original creation), which
+                    #   remains stable even after expiry updates the row's UPDATE_DATE_TIME.
+                    # If conf_insert_date != conf_date (dedicated INSERT_DATE_TIME exists),
+                    #   we use a simple WHERE filter since that column never changes.
+                    if conf_insert_date == conf_date:
+                        # Fallback: no INSERT_DATE_TIME — use MIN(UPDATE_DATE_TIME) per key
+                        ic_core_sql = (
+                            f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup}) "
+                            f"WHERE {core_date} > ? "
+                            f"AND ({trimmed}) IN ("
+                            f"  SELECT {trimmed} FROM {conf_from} "
+                            f"  GROUP BY {trimmed} "
+                            f"  HAVING MIN({conf_date}) <= ?)"
+                        )
+                    else:
+                        # Preferred: INSERT_DATE_TIME is immutable, simple filter
+                        ic_core_sql = (
+                            f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup}) "
+                            f"WHERE {core_date} > ? "
+                            f"AND ({trimmed}) IN ("
+                            f"  SELECT DISTINCT {trimmed} FROM {conf_from} "
+                            f"  WHERE {conf_insert_date} <= ?)"
+                        )
                     ic = int(session.sql(ic_core_sql,
-                             params=[core_wm, conf_wm, active_value]).collect()[0]["CNT"])
+                             params=[core_wm, conf_wm]).collect()[0]["CNT"])
                     # CONFORMED side: inactive records created after conf_wm
                     ic_conf_sql = (
                         f"SELECT COUNT(*)::INT AS CNT FROM {conf_from} "
@@ -271,54 +328,21 @@ def main(session, RULE):
                     ir = "PASS" if ic == io else "FAIL"
                     write_recon("INACTIVE_COUNT", ic, io, ir)
 
-                else:
-                    # First run: INACTIVE = count CONFORMED inactive at MAX(date)
-                    # and match against CORE keys that appear in that inactive set
-                    # (naturally 0=0 on first load with no inactive records)
-                    ic_conf_sql = (
-                        f"SELECT COUNT(*)::INT AS CNT FROM {conf_from} "
-                        f"WHERE {conf_date} = (SELECT MAX({conf_date}) FROM {conf_from}) "
-                        f"AND {flag_col} = ?"
-                    )
-                    io = int(session.sql(ic_conf_sql, params=[inactive_value]).collect()[0]["CNT"])
-                    # CORE side: count keys that appear in CONFORMED inactive (intersection)
-                    if io > 0:
-                        ic_core_sql = (
-                            f"SELECT COUNT(*)::INT AS CNT FROM ({core_dedup}) "
-                            f"WHERE {core_date} = (SELECT MAX({core_date}) FROM ({core_dedup})) "
-                            f"AND ({trimmed}) IN ("
-                            f"  SELECT {trimmed} FROM {conf_from} "
-                            f"  WHERE {conf_date} = (SELECT MAX({conf_date}) FROM {conf_from})"
-                            f"  AND {flag_col} = ?)"
-                        )
-                        ic = int(session.sql(ic_core_sql, params=[inactive_value]).collect()[0]["CNT"])
-                    else:
-                        ic = 0
-                    ir = "PASS" if ic == io else "FAIL"
-                    write_recon("INACTIVE_COUNT", ic, io, ir)
-
-                # Total cross-check (only meaningful in full mode)
-                if recon_mode == "full":
-                    total_core = ac + ic
-                    total_conf = ao + io
-                    total_result = "PASS" if total_core == total_conf else "FAIL"
-                    write_recon("TOTAL_COUNT", total_core, total_conf, total_result)
-                    overall_pass = (ar == "PASS") and (ir == "PASS") and (total_result == "PASS")
-                    total = total_core
-                    mism = abs(ac - ao) + abs(ic - io)
-                    results_obj = {
-                        "active": {"core": ac, "conformed": ao, "result": ar},
-                        "inactive": {"core": ic, "conformed": io, "result": ir},
-                        "total": {"core": total_core, "conformed": total_conf, "result": total_result},
-                    }
-                else:
-                    # Incremental: active + inactive are the only checks
                     overall_pass = (ar == "PASS") and (ir == "PASS")
                     total = ac
                     mism = abs(ac - ao) + abs(ic - io)
                     results_obj = {
                         "active": {"core": ac, "conformed": ao, "result": ar},
                         "inactive": {"core": ic, "conformed": io, "result": ir},
+                    }
+
+                else:
+                    # Safety net: same as full
+                    overall_pass = (ar == "PASS")
+                    total = ac
+                    mism = abs(ac - ao)
+                    results_obj = {
+                        "active": {"core": ac, "conformed": ao, "result": ar},
                     }
         else:
             # scd_type=0: plain total count (no dedup, no date filter)
@@ -331,7 +355,7 @@ def main(session, RULE):
             results_obj = {"total": {"core": cv, "conformed": ov, "result": r}}
 
         audit("MAIN_QUERY", "COMPLETED",
-              msg=f"scd_type={scd_type} mode={recon_mode} core_wm={core_wm} conf_wm={conf_wm} pass={overall_pass}")
+              msg=f"scd_type={scd_type} effective_mode={effective_mode} recon_mode={recon_mode} core_wm={core_wm} conf_wm={conf_wm} pass={overall_pass}")
     except Exception as e:
         audit("MAIN_QUERY", "FAILED", err=str(e))
         return error_code

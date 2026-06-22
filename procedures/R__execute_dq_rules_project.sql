@@ -1,7 +1,7 @@
 -- Project-level DQ orchestrator: runs every dataset in a project, correlated by a shared BATCH_ID
 -- Co-authored with CoCo
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 CREATE OR REPLACE PROCEDURE EXECUTE_DQ_RULES_PROJECT("P_PROJECT_ID" NUMBER(38, 0), "P_PARALLEL_JOBS" NUMBER(38, 0) DEFAULT 2)
 RETURNS VARIANT
 LANGUAGE PYTHON
@@ -15,19 +15,23 @@ import datetime
 
 
 def main(session, P_PROJECT_ID, P_PARALLEL_JOBS):
-    fw = "DQ_FRAMEWORK.METADATA"
+    # Default framework location — must be fully qualified since EXECUTE AS CALLER
+    # means the session context is the caller's, not the procedure's home schema.
+    _DEFAULT_FQN = "DQ_FRAMEWORK.METADATA"
+
+    # Read framework location from config (single source of truth)
+    _cfg = session.sql(
+        f"SELECT DQ_DB_NAME, DQ_SCHEMA_NAME, SUCCESS_CODE, FAILED_CODE, EXECUTION_ERROR "
+        f"FROM {_DEFAULT_FQN}.DQ_JOB_EXEC_CONFIG LIMIT 1"
+    ).collect()[0]
+    fw = f"{_cfg['DQ_DB_NAME']}.{_cfg['DQ_SCHEMA_NAME']}"
+    success_code = int(_cfg["SUCCESS_CODE"])
+    failed_code = int(_cfg["FAILED_CODE"])
+    error_code = int(_cfg["EXECUTION_ERROR"])
     started = datetime.datetime.now()
 
-    # Return codes from config
-    cfg = session.sql(
-        f"SELECT SUCCESS_CODE, FAILED_CODE, EXECUTION_ERROR FROM {fw}.DQ_JOB_EXEC_CONFIG LIMIT 1"
-    ).collect()[0]
-    success_code = int(cfg["SUCCESS_CODE"])
-    failed_code = int(cfg["FAILED_CODE"])
-    error_code = int(cfg["EXECUTION_ERROR"])
-
     # One batch id correlates all dataset runs of this project execution
-    batch_id = int(session.sql(f"SELECT {fw}.RUN_ID_SEQ.NEXTVAL").collect()[0][0])
+    batch_id = int(session.sql(f"SELECT {fw}.BATCH_ID_SEQ.NEXTVAL").collect()[0][0])
 
     # Datasets in this project
     ds_rows = session.sql(
@@ -67,23 +71,36 @@ def main(session, P_PROJECT_ID, P_PARALLEL_JOBS):
                                        "status": "SKIPPED_NO_RULES"})
             continue
 
+        # Capture the current max run ID BEFORE calling the master,
+        # so we only stamp BATCH_ID on a genuinely new run.
+        pre_max_run = int(session.sql(
+            f"SELECT COALESCE(MAX(DATASET_RUN_ID), 0) AS M "
+            f"FROM {fw}.DQ_DATASET_RUN_LOG WHERE DATASET_ID = {ds_id}"
+        ).collect()[0]["M"])
+
         # Run the dataset (rules parallelized inside the master)
         try:
             code = int(session.call(f"{fw}.EXECUTE_DQ_RULES_MASTER", ds_id, int(P_PARALLEL_JOBS)))
         except Exception as e:
             code = error_code
             summary["details"].append({"dataset_id": ds_id, "dataset_name": ds_name,
-                                       "status": "CALL_EXCEPTION", "error": str(e)})
+                                       "status": "CALL_EXCEPTION", "error": str(e)[:500]})
 
-        # Stamp the BATCH_ID on the run just created for this dataset
+        # Stamp the BATCH_ID only if a NEW run was created (avoids corrupting older runs)
         try:
-            session.sql(
-                f"UPDATE {fw}.DQ_DATASET_RUN_LOG SET BATCH_ID = {batch_id} "
-                f"WHERE DATASET_ID = {ds_id} "
-                f"AND DATASET_RUN_ID = (SELECT MAX(DATASET_RUN_ID) FROM {fw}.DQ_DATASET_RUN_LOG WHERE DATASET_ID = {ds_id})"
-            ).collect()
-        except Exception:
-            pass
+            post_max_run = int(session.sql(
+                f"SELECT COALESCE(MAX(DATASET_RUN_ID), 0) AS M "
+                f"FROM {fw}.DQ_DATASET_RUN_LOG WHERE DATASET_ID = {ds_id}"
+            ).collect()[0]["M"])
+            if post_max_run > pre_max_run:
+                session.sql(
+                    f"UPDATE {fw}.DQ_DATASET_RUN_LOG SET BATCH_ID = {batch_id} "
+                    f"WHERE DATASET_ID = {ds_id} AND DATASET_RUN_ID = {post_max_run}"
+                ).collect()
+        except Exception as e:
+            summary.setdefault("_warnings", []).append(
+                f"BATCH_ID stamp failed for dataset {ds_id}: {str(e)[:200]}"
+            )
 
         summary["datasets_run"] += 1
         if code == success_code:
@@ -121,8 +138,8 @@ def main(session, P_PROJECT_ID, P_PARALLEL_JOBS):
                     summary["datasets_skipped"], summary["passed"], summary["failed"],
                     summary["errored"], summary["status"], success_pct, run_time]
         ).collect()
-    except Exception:
-        pass
+    except Exception as e:
+        summary["_log_error"] = str(e)[:300]
 
     return summary
 $$;

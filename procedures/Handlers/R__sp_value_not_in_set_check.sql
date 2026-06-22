@@ -1,8 +1,8 @@
 -- DQ handler with ERROR_FLAG toggle to skip failed-record and primary-key capture
 -- Co-authored with CoCo
 -- Set the context (Ensure the session is pointed to the correct location)
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 
 CREATE OR REPLACE PROCEDURE SP_VALUE_NOT_IN_SET_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)

@@ -1,6 +1,6 @@
 -- Set the context (Ensure the session is pointed to the correct location)
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 
 CREATE OR REPLACE PROCEDURE SP_MOST_COMMON_VALUE_IN_SET_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)

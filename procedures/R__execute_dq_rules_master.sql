@@ -1,18 +1,17 @@
 -- DQ rules master orchestrator: full + selective (Option B) rule execution with RUN_SCOPE tracking
 -- Co-authored with CoCo
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 CREATE OR REPLACE PROCEDURE EXECUTE_DQ_RULES_MASTER("P_DATASET_ID" NUMBER(38, 0), "P_PARALLEL_JOBS" NUMBER(38, 0) DEFAULT 2, "P_RULE_CONFIG_IDS" VARCHAR DEFAULT NULL)
 RETURNS NUMBER(38, 0)
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python==*', 'joblib')
+PACKAGES = ('snowflake-snowpark-python==*')
 HANDLER = 'main'
 EXECUTE AS CALLER
 AS '
 import snowflake.snowpark as snowpark
 import datetime
-import joblib
 import json
 import re
 from json.decoder import JSONDecodeError
@@ -26,14 +25,24 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
         name = name.strip(''"'') 
         return ''"'' + name.replace(''"'', ''""'') + ''"''
 
-    # --- Framework location (fixed; independent of caller session context) ---
-    FRAMEWORK_DB = q_ident("DQ_FRAMEWORK")
-    FRAMEWORK_SCHEMA = q_ident("METADATA")
+    # --- Framework location: read from DQ_JOB_EXEC_CONFIG (single source of truth) ---
+    # Must use fully-qualified reference because EXECUTE AS CALLER means the session
+    # context is the caller''s (e.g. USER$ASLAM.PUBLIC), not the procedure''s home schema.
+    _DEFAULT_FQN = "DQ_FRAMEWORK.METADATA"
+    try:
+        _cfg_row = session.sql(
+            f"SELECT DQ_DB_NAME, DQ_SCHEMA_NAME FROM {_DEFAULT_FQN}.DQ_JOB_EXEC_CONFIG LIMIT 1"
+        ).collect()[0]
+        FRAMEWORK_DB = q_ident(_cfg_row["DQ_DB_NAME"])
+        FRAMEWORK_SCHEMA = q_ident(_cfg_row["DQ_SCHEMA_NAME"])
+    except Exception:
+        FRAMEWORK_DB = q_ident("DQ_FRAMEWORK")
+        FRAMEWORK_SCHEMA = q_ident("METADATA")
     FRAMEWORK_PATH = f"{FRAMEWORK_DB}.{FRAMEWORK_SCHEMA}"
 
     # Pin the active schema so unqualified refs in handlers resolve to the framework
     try:
-        session.sql("USE SCHEMA DQ_FRAMEWORK.METADATA").collect()
+        session.sql(f"USE SCHEMA {FRAMEWORK_PATH}").collect()
     except Exception:
         pass
 
@@ -71,7 +80,10 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
                 "status": result_status,
                 "code": result,
                 "audit_log": {
-                    "rule_config_id": rule_config.get("RULE_CONFIG_ID")
+                    "rule_config_id": rule_config.get("RULE_CONFIG_ID"),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "duration": (end_time - start_time).total_seconds()
                 }
             }
         except Exception as e:
@@ -88,6 +100,130 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
                     "error_message": f"Error during call to {sp_name}: {str(e)}"
                 }
             }
+
+    def execute_rules_async(session, rule_configs, config, parallel_jobs):
+        """
+        Execute rules using Snowflake async queries with batched concurrency.
+        Fires up to `parallel_jobs` rules at a time, waits for the batch to complete,
+        then fires the next batch. This prevents overwhelming the warehouse while
+        still achieving true server-side parallelism within each batch.
+        """
+
+        def _dispatch_one(rc):
+            """Fire a single rule async. Returns (job_info_dict)."""
+            sp_name = rc.get("SP_NAME")
+            if not sp_name:
+                return {
+                    "rule_config": rc,
+                    "async_job": None,
+                    "immediate_result": {
+                        "status": "ERROR",
+                        "code": config.get("EXECUTION_ERROR", 400),
+                        "audit_log": {
+                            "rule_config_id": rc.get("RULE_CONFIG_ID"),
+                            "status": "ERROR",
+                            "start_time": datetime.datetime.now(),
+                            "end_time": datetime.datetime.now(),
+                            "duration": 0,
+                            "error_message": f"Missing SP_NAME for rule {rc.get(''RULE_CONFIG_ID'')}"
+                        }
+                    }
+                }
+
+            sp_path = f"{FRAMEWORK_PATH}.{q_ident(sp_name)}"
+            rule_json = json.dumps(rc).replace("''", "\\''")
+            call_sql = f"CALL {sp_path}(PARSE_JSON(''{rule_json}''))"
+            start_time = datetime.datetime.now()
+
+            try:
+                async_job = session.sql(call_sql).collect_nowait()
+                return {
+                    "rule_config": rc,
+                    "async_job": async_job,
+                    "start_time": start_time,
+                    "immediate_result": None
+                }
+            except Exception as e:
+                return {
+                    "rule_config": rc,
+                    "async_job": None,
+                    "immediate_result": {
+                        "status": "ERROR",
+                        "code": config.get("EXECUTION_ERROR", 400),
+                        "audit_log": {
+                            "rule_config_id": rc.get("RULE_CONFIG_ID"),
+                            "status": "ERROR",
+                            "start_time": start_time,
+                            "end_time": datetime.datetime.now(),
+                            "duration": 0,
+                            "error_message": f"Async dispatch failed for {sp_name}: {str(e)}"
+                        }
+                    }
+                }
+
+        def _collect_one(job_info):
+            """Collect result from one async job. Returns result dict."""
+            if job_info["immediate_result"]:
+                return job_info["immediate_result"]
+
+            rc = job_info["rule_config"]
+            async_job = job_info["async_job"]
+            start_time = job_info["start_time"]
+            sp_name = rc.get("SP_NAME", "UNKNOWN")
+
+            try:
+                query_result = async_job.result()
+                end_time = datetime.datetime.now()
+
+                if query_result and len(query_result) > 0:
+                    result_code = query_result[0][0]
+                else:
+                    result_code = config.get("EXECUTION_ERROR", 400)
+
+                result_status = ("SUCCESS" if str(result_code) == str(config["SUCCESS_CODE"])
+                                 else "FAILURE" if str(result_code) == str(config["FAILED_CODE"])
+                                 else "ERROR")
+
+                return {
+                    "status": result_status,
+                    "code": result_code,
+                    "audit_log": {
+                        "rule_config_id": rc.get("RULE_CONFIG_ID"),
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "duration": (end_time - start_time).total_seconds()
+                    }
+                }
+            except Exception as e:
+                end_time = datetime.datetime.now()
+                return {
+                    "status": "ERROR",
+                    "code": config.get("EXECUTION_ERROR", 400),
+                    "audit_log": {
+                        "rule_config_id": rc.get("RULE_CONFIG_ID"),
+                        "status": "ERROR",
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "duration": (end_time - start_time).total_seconds(),
+                        "error_message": f"Async collect failed for {sp_name}: {str(e)}"
+                    }
+                }
+
+        # --- Batched execution: fire parallel_jobs at a time, wait, repeat ---
+        all_results = []
+        batch_size = max(1, int(parallel_jobs))
+
+        for batch_start in range(0, len(rule_configs), batch_size):
+            batch = rule_configs[batch_start:batch_start + batch_size]
+
+            # Dispatch entire batch (non-blocking)
+            batch_jobs = [_dispatch_one(rc) for rc in batch]
+
+            # Collect entire batch (blocks until all in this batch finish)
+            for job_info in batch_jobs:
+                all_results.append(_collect_one(job_info))
+
+        return all_results
 
     def format_for_sql(val, is_string=False):
         if val is None:
@@ -249,12 +385,22 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
             parallel_jobs = min(parallel_jobs, 30)
             
             try:
-                results_from_parallel_execution = joblib.Parallel(n_jobs=parallel_jobs, prefer="threads")(joblib.delayed(parallel_worker)(session, rc, config) for rc in rule_configs)
-            except Exception as e:
-                master_audit_logs.append((run_id, "EXECUTE_DQ_RULES_MASTER", "PARALLEL_EXECUTION", f"Parallel execution failed: {str(e)}", step_start_time, datetime.datetime.now(), "FAILED", f"Parallel execution failed: {str(e)}"))
-                error_count = len(rule_configs)
-                total_rules = len(rule_configs)
+                # Attempt async execution for true server-side parallelism.
+                # Each CALL runs in its own server-side execution context.
+                # Falls back to sequential if collect_nowait is unavailable.
+                results_from_parallel_execution = execute_rules_async(session, rule_configs, config, parallel_jobs)
+            except (AttributeError, TypeError):
+                # Fallback: collect_nowait not available in this Snowpark version.
+                # Run sequentially — still safe and correct.
                 results_from_parallel_execution = []
+                for rc in rule_configs:
+                    results_from_parallel_execution.append(parallel_worker(session, rc, config))
+            except Exception as e:
+                master_audit_logs.append((run_id, "EXECUTE_DQ_RULES_MASTER", "PARALLEL_EXECUTION", f"Async execution failed, falling back to sequential: {str(e)}", step_start_time, datetime.datetime.now(), "WARNING", str(e)))
+                # Fallback to sequential on any unexpected error
+                results_from_parallel_execution = []
+                for rc in rule_configs:
+                    results_from_parallel_execution.append(parallel_worker(session, rc, config))
 
             failed_rule_ids = []
             
@@ -326,78 +472,10 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
             # 1. Prepare Table Names and Paths
             clean_dataset_name = re.sub(r''[^a-zA-Z0-9]'', ''_'', data_asset["DATASET_NAME"])
             failure_table_name = f"{q_ident(config[''DQ_DB_NAME''])}.{q_ident(''DQ_ERRORS'')}.{q_ident(clean_dataset_name + ''_DQ_FAILURE'')}"
-            # export_file_path = f"dataset_failures/FAILED_ROWS_{clean_dataset_name}_{run_id}.csv.gz"
-            # final_file_name = f"''{export_file_path}''"
 
-            # 2. Fetch Metadata for dynamic headers
+            # Fetch Metadata for dynamic headers
             rules_config_table = f"{FRAMEWORK_PATH}.DQ_RULE_CONFIG"
             exp_master_table = f"{FRAMEWORK_PATH}.DQ_EXPECTATION_MASTER"
-
-            # --- FILE GENERATION DISABLED ---
-            # failed_rules_metadata = session.sql(f"""
-            #     SELECT 
-            #         r.RULE_CONFIG_ID, 
-            #         cc.EXPECTATION_ID,
-            #         cc.KWARGS,
-            #         COALESCE(UPPER(REPLACE(cc.COLUMN_NAME, '' '', ''_'')), ''TABLE'') as COL_NAME,
-            #         COALESCE(em.CHECK_TYPE, ''UNCATEROIZED'') as CATEGORY,
-            #         COALESCE(em.DIMENSION, ''UNCATEROIZED'') as DIMENSION
-            #     FROM {FRAMEWORK_PATH}.DQ_RULE_RESULTS r
-            #     JOIN {rules_config_table} cc ON r.RULE_CONFIG_ID = cc.RULE_CONFIG_ID
-            #     JOIN {exp_master_table} em ON cc.EXPECTATION_ID = em.EXPECTATION_ID
-            #     WHERE r.DATASET_RUN_ID = {run_id} AND r.IS_SUCCESS = FALSE
-            # """).collect()
-            # dynamic_cols = []
-            # for r in failed_rules_metadata:
-            #     category = r[''CATEGORY'']
-            #     rule_id = r[''RULE_CONFIG_ID'']
-            #     col_name = r[''COL_NAME'']
-            #     dimension = r[''DIMENSION'']
-            #     kwargs_json = r[''KWARGS'']
-            #     if kwargs_json:
-            #         try:
-            #             args = json.loads(kwargs_json)
-            #             if r[''EXPECTATION_ID''] == 10:
-            #                 vmin = args.get(''min_value'', ''MIN'')
-            #                 vmax = args.get(''max_value'', ''MAX'')
-            #                 category = f"{category}({vmin}_{vmax})"
-            #             elif r[''EXPECTATION_ID''] == 7:
-            #                 target_type = args.get(''type_'', ''UNKNOWN'')
-            #                 category = f"{category}({target_type})"
-            #             elif r[''EXPECTATION_ID''] == 18:
-            #                 lmin = args.get(''min_value'', ''MIN'')
-            #                 lmax = args.get(''max_value'', ''MAX'')
-            #                 category = f"{category}({lmin}_{lmax})"
-            #         except:
-            #             pass
-            #     header = f''"{col_name}_{dimension}_{category}_{rule_id}"''
-            #     col_sql = f"CASE WHEN MAX(IFF(RULE_CONFIG_ID = {rule_id}, 1, 0)) = 1 THEN ''FAIL'' ELSE ''PASS'' END AS {header}"
-            #     dynamic_cols.append(col_sql)
-            # pivot_sql_fragment = ", ".join(dynamic_cols)
-            # source_select_sql = f"""SELECT 
-            #             {run_id} AS DATASET_RUN_ID,
-            #             {P_DATASET_ID} AS DATASET_ID,
-            #             ''{data_asset[''DATASET_NAME'']}'' AS DATASET_NAME,
-            #             CURRENT_TIMESTAMP() AS EXPORT_TIMESTAMP,
-            #             {pivot_sql_fragment},
-            #             f.* EXCLUDE (RULE_CONFIG_ID, DATASET_RUN_ID, DATASET_ID, DQ_LOAD_TIMESTAMP)
-            #         FROM {failure_table_name} f
-            #         WHERE f.DATASET_RUN_ID = {run_id}
-            #         GROUP BY ALL"""
-            # copy_sql = f"""
-            #     COPY INTO {DQ_STAGE_NAME}/{export_file_path}
-            #     FROM (
-            #         {source_select_sql}
-            #     )
-            #     FILE_FORMAT = (TYPE = CSV compression=''gzip'' FIELD_OPTIONALLY_ENCLOSED_BY = ''"'' BINARY_FORMAT = ''HEX'')
-            #     HEADER = TRUE
-            #     SINGLE = TRUE
-            #     OVERWRITE = TRUE
-            #     MAX_FILE_SIZE = 5368709120
-            # """
-            # session.sql(copy_sql).collect()
-            # source_sql_text = source_select_sql
-            # --- END FILE GENERATION DISABLED ---
 
             all_rules_metadata = session.sql(f"""
                 SELECT DISTINCT
@@ -417,7 +495,7 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
                       SELECT DATASET_RUN_ID FROM {FRAMEWORK_PATH}.DQ_DATASET_RUN_LOG
                       WHERE DATASET_ID = {P_DATASET_ID}
                       AND COALESCE(RUN_SCOPE, ''FULL'') = ''FULL''
-                      ORDER BY DATASET_RUN_ID DESC LIMIT 90
+                      ORDER BY DATASET_RUN_ID DESC LIMIT 10
                     )
                     UNION
                     SELECT {run_id}
@@ -449,8 +527,8 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
                                 lmin = args.get(''min_value'', ''MIN'')
                                 lmax = args.get(''max_value'', ''MAX'')
                                 category = f"{category}({lmin}_{lmax})"
-                        except:
-                            pass
+                        except Exception:
+                            category = f"{category}_PARSE_ERROR"
                     header = f''"{col_name}_{dimension}_{category}_{rule_id}"''
                     check_level = r[''CHECK_LEVEL'']
                     if check_level != ''ROW'':
@@ -503,8 +581,8 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
     
     try:
         log_and_return(session, config, master_audit_logs, 0)
-    except Exception as e:
-        pass
+    except Exception as log_err:
+        master_audit_logs.append((run_id, "EXECUTE_DQ_RULES_MASTER", "AUDIT_LOG_FLUSH", f"Failed to flush audit logs: {str(log_err)[:300]}", datetime.datetime.now(), datetime.datetime.now(), "FAILED", str(log_err)[:500]))
     
     try:
         run_log_table_path = f"{config[''DQ_DB_NAME'']}.{config[''DQ_SCHEMA_NAME'']}.DQ_DATASET_RUN_LOG"
@@ -519,8 +597,8 @@ def main(session: snowpark.Session, P_DATASET_ID, P_PARALLEL_JOBS, P_RULE_CONFIG
         master_audit_logs.append((run_id, "EXECUTE_DQ_RULES_MASTER", "RUN_LOG_INSERT", f"Failed to insert run log: {str(e)}", datetime.datetime.now(), datetime.datetime.now(), "FAILED", f"Failed to insert run log: {str(e)}"))
         try:
             log_and_return(session, config, master_audit_logs, 0)
-        except:
-            pass
+        except Exception as retry_err:
+            session.sql(f"INSERT INTO {FRAMEWORK_PATH}.DQ_RULE_AUDIT_LOG (DATASET_RUN_ID, STEP_NAME, SUB_STEP, STEP_DESCRIPTION, STEP_START_TIMESTAMP, STEP_END_TIMESTAMP, STEP_STATUS, ERROR_MESSAGE) VALUES ({run_id}, ''EXECUTE_DQ_RULES_MASTER'', ''FINAL_LOG_RETRY'', ''Audit log flush failed on retry'', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), ''FAILED'', ''{str(retry_err)[:200]}'')").collect()
 
     # Final Return Code Logic
     if error_count > 0 or file_generation_error: 

@@ -1,4 +1,5 @@
 -- DQ Framework: baseline DDL for all metadata tables (schemachange versioned, DDL only)
+-- Co-authored with CoCo
 CREATE DATABASE IF NOT EXISTS DQ_FRAMEWORK;
 
 USE DATABASE DQ_FRAMEWORK;
@@ -9,8 +10,11 @@ CREATE SCHEMA IF NOT EXISTS DQ_ERRORS;
 
 USE SCHEMA METADATA;
 
--- Sequence used to allocate DATASET_RUN_ID / BATCH_ID values
+-- Sequence used to allocate DATASET_RUN_ID values (individual dataset runs)
 CREATE SEQUENCE IF NOT EXISTS RUN_ID_SEQ START WITH 1 INCREMENT BY 1 ORDER;
+
+-- Sequence used to allocate BATCH_ID values (project-level correlation across dataset runs)
+CREATE SEQUENCE IF NOT EXISTS BATCH_ID_SEQ START WITH 1000 INCREMENT BY 1 ORDER;
 
 CREATE TABLE IF NOT EXISTS DQ_DATASET (
     DATASET_ID NUMBER(38, 0),

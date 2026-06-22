@@ -1,7 +1,7 @@
 -- DQ handler with ERROR_FLAG toggle to skip failed-record and primary-key capture
 -- Co-authored with CoCo
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 CREATE OR REPLACE PROCEDURE SP_UNIQUENESS_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)
 LANGUAGE SQL

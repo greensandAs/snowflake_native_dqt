@@ -1,6 +1,6 @@
 -- -- Set the context (Ensure the session is pointed to the correct location)
-USE DATABASE DQ_FRAMEWORK;
-USE SCHEMA METADATA;
+USE DATABASE {{framework_db}};
+USE SCHEMA {{framework_schema}};
 
 CREATE OR REPLACE PROCEDURE SP_UNIQUE_VALUE_COUNT_BETWEEN_CHECK("RULE" VARIANT)
 RETURNS NUMBER(38, 0)
